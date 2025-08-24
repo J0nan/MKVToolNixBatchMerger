@@ -6,8 +6,6 @@ import sys
 import subprocess
 import traceback
 from pymkv import MKVFile
-# import tempfile
-# import shutil
 import threading
 
 class Pymkv2MergerApp:
