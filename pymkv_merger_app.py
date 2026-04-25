@@ -236,28 +236,81 @@ class Pymkv2MergerApp:
         ms_rem = ms % 1000
         minutes = seconds // 60
         seconds_rem = seconds % 60
-        if minutes > 0:
-            return f"{minutes}m {seconds_rem}s {ms_rem}ms"
-        return f"{seconds_rem}s {ms_rem}ms"
+        hours = minutes // 60
+        minutes_rem = minutes % 60
+        return f"{hours:02d}:{minutes_rem:02d}:{seconds_rem:02d}.{ms_rem:03d}"
+
+    def _show_mismatch_dialog(self, mismatched_files):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Mismatched Durations")
+        dialog.geometry("750x400")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        choice_var = tk.StringVar(value="cancel")
+
+        def set_choice(c):
+            choice_var.set(c)
+            dialog.destroy()
+
+        dialog.protocol("WM_DELETE_WINDOW", lambda: set_choice("cancel"))
+
+        lbl = ttk.Label(dialog, text="The following files have mismatched durations (> 100ms difference):", font=("TkDefaultFont", 10, "bold"))
+        lbl.pack(pady=10, padx=10, anchor="w")
+
+        frame = ttk.Frame(dialog)
+        frame.pack(fill="both", expand=True, padx=10, pady=5)
+        
+        cols = ("file", "dur1", "dur2", "diff")
+        tree = ttk.Treeview(frame, columns=cols, show="headings")
+        tree.heading("file", text="Filename")
+        tree.heading("dur1", text="File 1 Duration")
+        tree.heading("dur2", text="File 2 Duration")
+        tree.heading("diff", text="Difference")
+        
+        tree.column("file", width=350, anchor="w")
+        tree.column("dur1", width=120, anchor="center")
+        tree.column("dur2", width=120, anchor="center")
+        tree.column("diff", width=120, anchor="center")
+
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        for fname, d1, d2 in mismatched_files:
+            diff_ns = abs(d1 - d2)
+            tree.insert("", "end", values=(
+                fname,
+                self._format_ns(d1),
+                self._format_ns(d2),
+                self._format_ns(diff_ns)
+            ))
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(fill="x", pady=15, padx=10)
+
+        ttk.Button(btn_frame, text="Continue merging ALL", command=lambda: set_choice("all")).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="EXCLUDE mismatched files", command=lambda: set_choice("exclude")).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=lambda: set_choice("cancel")).pack(side="right", padx=5)
+
+        self.root.wait_window(dialog)
+        return choice_var.get()
 
     def _on_analysis_complete(self, mismatched_files, matching_files):
         if self.progress_window and tk.Toplevel.winfo_exists(self.progress_window):
-            self.progress_window.destroy()
+            try:
+                self.progress_window.destroy()
+            except Exception:
+                pass
             
         if mismatched_files:
-            msg = "The following files have mismatched durations (> 100ms difference):\n\n"
-            for fname, d1, d2 in mismatched_files[:10]:
-                msg += f"- {fname}\n  File 1: {self._format_ns(d1)}, File 2: {self._format_ns(d2)}\n"
-            if len(mismatched_files) > 10:
-                msg += f"... and {len(mismatched_files)-10} more.\n"
-                
-            msg += "\nYes: Continue merging ALL files.\nNo: Continue but EXCLUDE mismatched files.\nCancel: Abort entirely."
+            choice = self._show_mismatch_dialog(mismatched_files)
             
-            choice = messagebox.askyesnocancel("Mismatched Durations", msg, parent=self.root)
-            
-            if choice is None: # Cancel
+            if choice == "cancel":
                 return
-            elif choice is False: # No (Exclude mismatches)
+            elif choice == "exclude":
                 mismatched_names = {item[0] for item in mismatched_files}
                 matching_files = [f for f in matching_files if f not in mismatched_names]
                 if not matching_files:
@@ -732,7 +785,7 @@ class Pymkv2MergerApp:
             if self.cancel_event.is_set():
                 return False, filename, Exception("Cancelled by user")
             try:
-                print(f"\n[INFO] Starting merge for {filename} (file {i+1}/{total_files})")
+                print(f"[INFO] Starting merge for {filename} (file {i+1}/{total_files})")
                 src1 = os.path.join(folder1, filename)
                 src2 = os.path.join(folder2, filename)
                 final_output = os.path.join(output_folder, filename)
