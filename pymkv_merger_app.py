@@ -7,6 +7,7 @@ import subprocess
 import traceback
 from pymkv import MKVFile
 import threading
+import concurrent.futures
 
 class Pymkv2MergerApp:
     def __init__(self, root):
@@ -15,12 +16,22 @@ class Pymkv2MergerApp:
         self.root.geometry("750x360")
 
         self.mkvtoolnix_path = tk.StringVar()
+        if sys.platform == "win32":
+            default_path = r"C:\Program Files\MKVToolNix"
+            if os.path.isdir(default_path) and os.path.exists(os.path.join(default_path, "mkvmerge.exe")):
+                self.mkvtoolnix_path.set(default_path)
+                mkvmerge_exe = "mkvmerge.exe"
+                MKVFile.mkvmerge_path = os.path.join(default_path, mkvmerge_exe)
+                
         self.folder1_path = tk.StringVar()
         self.folder2_path = tk.StringVar()
         self.output_folder_path = tk.StringVar()
         self.track_selections = {}
 
         self.metadata_title = tk.StringVar()
+        self.max_threads = tk.IntVar(value=min(4, os.cpu_count() or 4))
+
+        self.load_settings()
 
         self.include_chapters_file1 = tk.BooleanVar(value=False)
         self.include_chapters_file2 = tk.BooleanVar(value=False)
@@ -44,7 +55,49 @@ class Pymkv2MergerApp:
         self.accept_button = None
 
         self.start_merge_button = None
+        self.export_script_button = None
         self.merge_thread = None
+        self.check_thread = None
+        self.export_thread = None
+        self.cancel_button = None
+        self._current_matching_files = None
+        self.cancel_event = threading.Event()
+
+    def get_settings_path(self):
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "mkv_merger_settings.json")
+
+    def load_settings(self):
+        settings_path = self.get_settings_path()
+        if os.path.exists(settings_path):
+            try:
+                with open(settings_path, "r", encoding="utf-8") as f:
+                    settings = json.load(f)
+                
+                if settings.get("mkvtoolnix_path"):
+                    self.mkvtoolnix_path.set(settings["mkvtoolnix_path"])
+                    mkvmerge_exe = "mkvmerge.exe" if sys.platform == "win32" else "mkvmerge"
+                    MKVFile.mkvmerge_path = os.path.join(settings["mkvtoolnix_path"], mkvmerge_exe)
+                
+                if settings.get("folder1_path"): self.folder1_path.set(settings["folder1_path"])
+                if settings.get("folder2_path"): self.folder2_path.set(settings["folder2_path"])
+                if settings.get("output_folder_path"): self.output_folder_path.set(settings["output_folder_path"])
+                if settings.get("max_threads"): self.max_threads.set(settings["max_threads"])
+            except Exception as e:
+                print(f"[ERROR] Could not load settings: {e}")
+
+    def save_settings(self):
+        settings = {
+            "mkvtoolnix_path": self.mkvtoolnix_path.get(),
+            "folder1_path": self.folder1_path.get(),
+            "folder2_path": self.folder2_path.get(),
+            "output_folder_path": self.output_folder_path.get(),
+            "max_threads": self.max_threads.get()
+        }
+        try:
+            with open(self.get_settings_path(), "w", encoding="utf-8") as f:
+                json.dump(settings, f, indent=4)
+        except Exception as e:
+            print(f"[ERROR] Could not save settings: {e}")
 
     def create_path_selection_widgets(self, parent):
         path_frame = ttk.LabelFrame(parent, text="File and Folder Paths")
@@ -66,6 +119,10 @@ class Pymkv2MergerApp:
         ttk.Entry(path_frame, textvariable=self.output_folder_path, width=68).grid(row=3, column=1, padx=5, pady=5)
         ttk.Button(path_frame, text="Browse...", command=lambda: self.browse_folder(self.output_folder_path)).grid(row=3, column=2, padx=5, pady=5)
 
+        ttk.Label(path_frame, text="Max Threads:").grid(row=4, column=0, sticky="w", padx=5, pady=5)
+        thread_spinbox = ttk.Spinbox(path_frame, from_=1, to=16, textvariable=self.max_threads, width=5)
+        thread_spinbox.grid(row=4, column=1, sticky="w", padx=5, pady=5)
+
     def browse_mkvtoolnix(self):
         path = filedialog.askdirectory(title="Select MKVToolNix Installation Folder")
         if path:
@@ -73,12 +130,14 @@ class Pymkv2MergerApp:
             mkvmerge_exe = "mkvmerge.exe" if sys.platform == "win32" else "mkvmerge"
             MKVFile.mkvmerge_path = os.path.join(path, mkvmerge_exe)
             print(f"[INFO] mkvmerge path set to: {MKVFile.mkvmerge_path}")
+            self.save_settings()
 
     def browse_folder(self, path_var):
         path = filedialog.askdirectory()
         if path:
             path_var.set(path)
             print(f"[INFO] Folder path set to: {path}")
+            self.save_settings()
 
     def validate_paths(self):
         if not self.mkvtoolnix_path.get() or not os.path.isdir(self.mkvtoolnix_path.get()):
@@ -108,12 +167,108 @@ class Pymkv2MergerApp:
 
     def setup_track_selection(self):
         if not self.validate_paths(): return
+        self.save_settings()
         matching_files = self.find_matching_files()
         if not matching_files:
             messagebox.showinfo("Information", "No matching files found.")
             print(f"[INFO] No matching files found")
             return
 
+        self.show_progress_window(len(matching_files))
+        if self.merge_progress_label:
+            self.merge_progress_label.config(text="Analyzing file durations...")
+
+        self.check_thread = threading.Thread(target=self._analyze_durations_worker, args=(matching_files,), daemon=True)
+        self.check_thread.start()
+
+    def _analyze_durations_worker(self, matching_files):
+        mismatched_files = []
+        total_files = len(matching_files)
+        folder1 = self.folder1_path.get()
+        folder2 = self.folder2_path.get()
+        max_w = self.max_threads.get()
+
+        completed_files = 0
+        lock = threading.Lock()
+
+        def _process_single(i, filename):
+            path1 = os.path.join(folder1, filename)
+            path2 = os.path.join(folder2, filename)
+            
+            data1 = self.parse_mkvmerge_json(path1)
+            data2 = self.parse_mkvmerge_json(path2)
+            
+            if data1 and data2:
+                dur1 = data1.get("container", {}).get("properties", {}).get("duration")
+                dur2 = data2.get("container", {}).get("properties", {}).get("duration")
+                
+                if dur1 is not None and dur2 is not None:
+                    if abs(dur1 - dur2) > 100000000:
+                        return (filename, dur1, dur2)
+            return None
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_w) as executor:
+            futures = {executor.submit(_process_single, i, fname): fname for i, fname in enumerate(matching_files)}
+            for future in concurrent.futures.as_completed(futures):
+                res = future.result()
+                if res:
+                    mismatched_files.append(res)
+                
+                with lock:
+                    completed_files += 1
+                    c = completed_files
+                self.root.after(0, lambda curr=c, f=futures[future]: self._update_analyze_progress(curr, f, total_files))
+
+        self.root.after(0, lambda: self._on_analysis_complete(mismatched_files, matching_files))
+
+    def _update_analyze_progress(self, current, filename, total):
+        try:
+            if self.merge_progressbar:
+                self.merge_progressbar["value"] = current
+            if self.merge_progress_label:
+                self.merge_progress_label.config(text=f"Analyzing duration: {filename} ({current}/{total})")
+        except Exception:
+            pass
+
+    def _format_ns(self, ns):
+        ms = ns // 1000000
+        seconds = ms // 1000
+        ms_rem = ms % 1000
+        minutes = seconds // 60
+        seconds_rem = seconds % 60
+        if minutes > 0:
+            return f"{minutes}m {seconds_rem}s {ms_rem}ms"
+        return f"{seconds_rem}s {ms_rem}ms"
+
+    def _on_analysis_complete(self, mismatched_files, matching_files):
+        if self.progress_window and tk.Toplevel.winfo_exists(self.progress_window):
+            self.progress_window.destroy()
+            
+        if mismatched_files:
+            msg = "The following files have mismatched durations (> 100ms difference):\n\n"
+            for fname, d1, d2 in mismatched_files[:10]:
+                msg += f"- {fname}\n  File 1: {self._format_ns(d1)}, File 2: {self._format_ns(d2)}\n"
+            if len(mismatched_files) > 10:
+                msg += f"... and {len(mismatched_files)-10} more.\n"
+                
+            msg += "\nYes: Continue merging ALL files.\nNo: Continue but EXCLUDE mismatched files.\nCancel: Abort entirely."
+            
+            choice = messagebox.askyesnocancel("Mismatched Durations", msg, parent=self.root)
+            
+            if choice is None: # Cancel
+                return
+            elif choice is False: # No (Exclude mismatches)
+                mismatched_names = {item[0] for item in mismatched_files}
+                matching_files = [f for f in matching_files if f not in mismatched_names]
+                if not matching_files:
+                    messagebox.showinfo("Information", "No files left to process after exclusion.")
+                    return
+                
+        self._current_matching_files = matching_files
+        self._continue_setup_track_selection()
+
+    def _continue_setup_track_selection(self):
+        matching_files = self._current_matching_files
         sample_filename = matching_files[0]
         path1 = os.path.join(self.folder1_path.get(), sample_filename)
         path2 = os.path.join(self.folder2_path.get(), sample_filename)
@@ -162,6 +317,9 @@ class Pymkv2MergerApp:
 
         self.start_merge_button = ttk.Button(button_frame, text="Start Merging", command=self.start_merging)
         self.start_merge_button.pack(side="right", padx=10)
+
+        self.export_script_button = ttk.Button(button_frame, text="Export Batch Script", command=self.export_batch_script)
+        self.export_script_button.pack(side="right", padx=5)
 
     def create_global_properties_widgets(self, parent, mkv1, filename,
                                          has_chapters1=False, has_chapters2=False,
@@ -421,9 +579,18 @@ class Pymkv2MergerApp:
         self.merge_progress_label = ttk.Label(container, text="Preparing...")
         self.merge_progress_label.pack()
 
+        self.cancel_button = ttk.Button(container, text="Cancel", command=self.cancel_merge)
+        self.cancel_button.pack(pady=(12, 0))
+
         self.accept_button = None
         self.progress_window.lift()
         self.root.update_idletasks()
+
+    def cancel_merge(self):
+        self.cancel_event.set()
+        if hasattr(self, 'cancel_button') and self.cancel_button:
+            self.cancel_button.state(["disabled"])
+            self.cancel_button.config(text="Cancelling...")
 
     def finish_progress_window(self, final_text, success=True):
         def _finish():
@@ -431,6 +598,10 @@ class Pymkv2MergerApp:
                 return
             self.progress_window.protocol("WM_DELETE_WINDOW", self.progress_window.destroy)
             self.merge_progress_label.config(text=final_text)
+
+            cb = getattr(self, 'cancel_button', None)
+            if cb is not None and cb.winfo_exists():
+                cb.pack_forget()
 
             if not self.accept_button:
                 try:
@@ -441,8 +612,25 @@ class Pymkv2MergerApp:
                 except Exception:
                     self.progress_window.geometry("450x200")
 
-                self.accept_button = ttk.Button(self.progress_window, text="Accept", command=self.progress_window.destroy, width=14)
-                self.accept_button.pack(side="bottom", pady=14, ipadx=8, ipady=6)
+                button_frame = ttk.Frame(self.progress_window)
+                button_frame.pack(side="bottom", pady=14)
+
+                self.accept_button = ttk.Button(button_frame, text="Accept", command=self.progress_window.destroy, width=14)
+                self.accept_button.pack(side="left", padx=5, ipadx=8, ipady=6)
+                
+                if success and self.output_folder_path.get():
+                    import subprocess
+                    def open_folder():
+                        if sys.platform == 'win32':
+                            os.startfile(self.output_folder_path.get())
+                        elif sys.platform == 'darwin':
+                            subprocess.Popen(['open', self.output_folder_path.get()])
+                        else:
+                            subprocess.Popen(['xdg-open', self.output_folder_path.get()])
+                            
+                    open_folder_btn = ttk.Button(button_frame, text="Open Output Folder", command=open_folder, width=18)
+                    open_folder_btn.pack(side="left", padx=5, ipadx=8, ipady=6)
+
                 self.progress_window.update_idletasks()
 
             if success and self.merge_progressbar:
@@ -474,7 +662,10 @@ class Pymkv2MergerApp:
         except Exception:
             pass
 
-        matching_files = self.find_matching_files()
+        matching_files = getattr(self, '_current_matching_files', None)
+        if not matching_files:
+            matching_files = self.find_matching_files()
+            
         if not matching_files:
             messagebox.showinfo("Information", "No matching files found.")
             print(f"[ERROR] No matching files found")
@@ -492,24 +683,59 @@ class Pymkv2MergerApp:
         self.merge_thread.start()
 
     def _merge_worker(self, matching_files):
+        total_files = len(matching_files)
+        completed_files = 0
         error_occurred = False
+        lock = threading.Lock()
 
-        for i, filename in enumerate(matching_files):
-            def ui_update(idx=i, fname=filename):
-                try:
-                    if self.merge_progressbar:
-                        self.merge_progressbar["value"] = idx + 1
-                    if self.merge_progress_label:
-                        self.merge_progress_label.config(text=f"Processing: {fname} ({idx+1}/{len(matching_files)})")
-                except Exception:
-                    pass
-            self.root.after(0, ui_update)
+        # Capture Tkinter variables in a thread-safe way, before starting pool
+        folder1 = self.folder1_path.get()
+        folder2 = self.folder2_path.get()
+        output_folder = self.output_folder_path.get()
+        title = self.metadata_title.get()
 
+        inc_chap_1 = self.include_chapters_file1.get()
+        inc_chap_2 = self.include_chapters_file2.get()
+        inc_tags_1 = self.include_global_tags_file1.get()
+        inc_tags_2 = self.include_global_tags_file2.get()
+        inc_att_1 = self.include_attachments_file1.get()
+        inc_att_2 = self.include_attachments_file2.get()
+
+        # Track settings snapshot
+        ts_snapshot_1 = []
+        for s in self.track_selections.get(1, []):
+            ts_snapshot_1.append({
+                "track_obj": s["track_obj"],
+                "include": s["include"].get(),
+                "language": s["language"].get(),
+                "name": s["name"].get(),
+                "default": s["default"].get(),
+                "forced": s["forced"].get()
+            })
+            
+        ts_snapshot_2 = []
+        for s in self.track_selections.get(2, []):
+            ts_snapshot_2.append({
+                "track_obj": s["track_obj"],
+                "include": s["include"].get(),
+                "language": s["language"].get(),
+                "name": s["name"].get(),
+                "default": s["default"].get(),
+                "forced": s["forced"].get()
+            })
+
+        max_w = self.max_threads.get()
+        self.cancel_event.clear()
+        error_log_entries = []
+
+        def _process_single_file(i, filename):
+            if self.cancel_event.is_set():
+                return False, filename, Exception("Cancelled by user")
             try:
-                print(f"\n[INFO] Starting merge for {filename} (file {i+1}/{len(matching_files)})")
-                src1 = os.path.join(self.folder1_path.get(), filename)
-                src2 = os.path.join(self.folder2_path.get(), filename)
-                final_output = os.path.join(self.output_folder_path.get(), filename)
+                print(f"\n[INFO] Starting merge for {filename} (file {i+1}/{total_files})")
+                src1 = os.path.join(folder1, filename)
+                src2 = os.path.join(folder2, filename)
+                final_output = os.path.join(output_folder, filename)
 
                 if not os.path.exists(src1) or not os.path.exists(src2):
                     print(f"[ERROR] Source files missing for {filename}")
@@ -519,60 +745,48 @@ class Pymkv2MergerApp:
                 src_mkv2 = MKVFile(src2)
 
                 new_mkv = MKVFile()
-                new_mkv.title = self.metadata_title.get()
+                new_mkv.title = title
 
-                for selection in self.track_selections.get(1, []):
-                    if selection["include"].get():
+                for selection in ts_snapshot_1:
+                    if selection["include"]:
                         matching_track = next((t for t in src_mkv1.tracks if t.track_id == selection["track_obj"].track_id), None)
                         if matching_track:
-                            self.apply_track_settings(matching_track, selection)
+                            matching_track.language = selection["language"]
+                            matching_track.track_name = selection["name"]
+                            matching_track.default_track = selection["default"]
+                            matching_track.forced_track = selection["forced"]
                             new_mkv.add_track(matching_track)
 
-                for selection in self.track_selections.get(2, []):
-                    if selection["include"].get():
+                for selection in ts_snapshot_2:
+                    if selection["include"]:
                         matching_track = next((t for t in src_mkv2.tracks if t.track_id == selection["track_obj"].track_id), None)
                         if matching_track:
-                            self.apply_track_settings(matching_track, selection)
+                            matching_track.language = selection["language"]
+                            matching_track.track_name = selection["name"]
+                            matching_track.default_track = selection["default"]
+                            matching_track.forced_track = selection["forced"]
                             new_mkv.add_track(matching_track)
 
-                if not self.include_chapters_file1.get():
-                    print(f"[INFO] Chapters NOT requested: removing chapters from File 1: {src1}")
-                    try:
-                        src_mkv1.no_chapters()
-                    except AttributeError:
-                        print("[WARN] MKVFile.no_chapters() not available in this pymkv2 version.")
-                if not self.include_chapters_file2.get():
-                    print(f"[INFO] Chapters NOT requested: removing chapters from File 2: {src2}")
-                    try:
-                        src_mkv2.no_chapters()
-                    except AttributeError:
-                        print("[WARN] MKVFile.no_chapters() not available in this pymkv2 version.")
+                if not inc_chap_1:
+                    try: src_mkv1.no_chapters()
+                    except AttributeError: pass
+                if not inc_chap_2:
+                    try: src_mkv2.no_chapters()
+                    except AttributeError: pass
 
-                if not self.include_global_tags_file1.get():
-                    print(f"[INFO] Global tags NOT requested: removing global tags from File 1: {src1}")
-                    try:
-                        src_mkv1.no_global_tags()
-                    except AttributeError:
-                        print("[WARN] MKVFile no_global_tags method not available in this pymkv2 version.")
-                if not self.include_global_tags_file2.get():
-                    print(f"[INFO] Global tags NOT requested: removing global tags from File 2: {src2}")
-                    try:
-                        src_mkv2.no_global_tags()
-                    except AttributeError:
-                        print("[WARN] MKVFile no_global_tags/no_tags method not available in this pymkv2 version.")
+                if not inc_tags_1:
+                    try: src_mkv1.no_global_tags()
+                    except AttributeError: pass
+                if not inc_tags_2:
+                    try: src_mkv2.no_global_tags()
+                    except AttributeError: pass
 
-                if not self.include_attachments_file1.get():
-                    print(f"[INFO] Attachments NOT requested: removing attachments from File 1: {src1}")
-                    try:
-                        src_mkv1.no_attachments()
-                    except AttributeError:
-                        print("[WARN] MKVFile.no_attachments() not available in this pymkv2 version.")
-                if not self.include_attachments_file2.get():
-                    print(f"[INFO] Attachments NOT requested: removing attachments from File 2: {src2}")
-                    try:
-                        src_mkv2.no_attachments()
-                    except AttributeError:
-                        print("[WARN] MKVFile.no_attachments() not available in this pymkv2 version.")
+                if not inc_att_1:
+                    try: src_mkv1.no_attachments()
+                    except AttributeError: pass
+                if not inc_att_2:
+                    try: src_mkv2.no_attachments()
+                    except AttributeError: pass
 
                 try:
                     new_mkv.mux(final_output, silent=True)
@@ -580,23 +794,224 @@ class Pymkv2MergerApp:
                     print(f"[ERROR] pymkv2 mux failed for {filename}: {e}")
                     traceback.print_exc()
                     raise
-
+                    
+                return True, filename, None
             except Exception as e:
-                error_occurred = True
-                err_text = f"Error merging {filename}: {e}"
-                print(f"[ERROR] {err_text}")
                 traceback.print_exc()
-                self.root.after(0, lambda: self.finish_progress_window(err_text, success=False))
-                break
+                return False, filename, e
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_w) as executor:
+            futures = {executor.submit(_process_single_file, i, filename): filename for i, filename in enumerate(matching_files)}
+            
+            for future in concurrent.futures.as_completed(futures):
+                success, filename, err = future.result()
+                
+                with lock:
+                    completed_files += 1
+                    current_completed = completed_files
+                
+                def ui_update(c=current_completed, fname=filename):
+                    try:
+                        if self.merge_progressbar:
+                            self.merge_progressbar["value"] = c
+                        if self.merge_progress_label:
+                            self.merge_progress_label.config(text=f"Processed: {fname} ({c}/{total_files})")
+                    except Exception:
+                        pass
+                
+                self.root.after(0, ui_update)
+                
+                if not success:
+                    error_occurred = True
+                    err_str = str(err)
+                    if err_str != "Cancelled by user":
+                        error_log_entries.append(f"[{filename}] Error: {err}")
+                    
+                    err_text = f"Error merging {filename}: {err}" if err_str != "Cancelled by user" else "Merge cancelled."
+                    print(f"[ERROR] {err_text}")
+                    self.root.after(0, lambda e_t=err_text: self.finish_progress_window(e_t, success=(err_str == "Cancelled by user")))
+                    try:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                    except TypeError:
+                        pass
+                    break
+
+        if error_log_entries:
+            log_path = os.path.join(output_folder, "mkv_merger_error_log.txt")
+            try:
+                import datetime
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(f"\n--- Errors at {datetime.datetime.now()} ---\n")
+                    f.write("\n".join(error_log_entries))
+            except Exception:
+                pass
 
         if not error_occurred:
             self.root.after(0, lambda: self.finish_progress_window("All files merged successfully!", success=True))
 
-    def apply_track_settings(self, track, selection):
-        track.language = selection["language"].get()
-        track.track_name = selection["name"].get()
-        track.default_track = selection["default"].get()
-        track.forced_track = selection["forced"].get()
+    def export_batch_script(self):
+        matching_files = getattr(self, '_current_matching_files', None)
+        if not matching_files:
+            matching_files = self.find_matching_files()
+            if not matching_files:
+                return
+            
+        script_path = filedialog.asksaveasfilename(defaultextension=".bat", filetypes=[("Batch script", "*.bat"), ("Shell script", "*.sh")])
+        if not script_path:
+            return
+
+        self.show_progress_window(len(matching_files))
+        if self.merge_progress_label:
+            self.merge_progress_label.config(text="Generating script...")
+        
+        if hasattr(self, 'cancel_button') and self.cancel_button:
+            self.cancel_button.destroy()
+
+        self.export_thread = threading.Thread(target=self._export_worker, args=(matching_files, script_path), daemon=True)
+        self.export_thread.start()
+
+    def _export_worker(self, matching_files, script_path):
+        commands = []
+        is_bat = script_path.lower().endswith(".bat")
+        
+        if is_bat:
+            commands.append("@echo off")
+        else:
+            commands.append("#!/bin/bash")
+            
+        folder1 = self.folder1_path.get()
+        folder2 = self.folder2_path.get()
+        output_folder = self.output_folder_path.get()
+        title = self.metadata_title.get()
+
+        inc_chap_1 = self.include_chapters_file1.get()
+        inc_chap_2 = self.include_chapters_file2.get()
+        inc_tags_1 = self.include_global_tags_file1.get()
+        inc_tags_2 = self.include_global_tags_file2.get()
+        inc_att_1 = self.include_attachments_file1.get()
+        inc_att_2 = self.include_attachments_file2.get()
+
+        ts_snapshot_1 = []
+        for s in self.track_selections.get(1, []):
+            ts_snapshot_1.append({
+                "track_obj": s["track_obj"], "include": s["include"].get(),
+                "language": s["language"].get(), "name": s["name"].get(),
+                "default": s["default"].get(), "forced": s["forced"].get()
+            })
+            
+        ts_snapshot_2 = []
+        for s in self.track_selections.get(2, []):
+            ts_snapshot_2.append({
+                "track_obj": s["track_obj"], "include": s["include"].get(),
+                "language": s["language"].get(), "name": s["name"].get(),
+                "default": s["default"].get(), "forced": s["forced"].get()
+            })
+
+        for i, filename in enumerate(matching_files):
+            try:
+                self.root.after(0, lambda c=i: self.merge_progressbar.config(value=c) if self.merge_progressbar else None)
+                src1 = os.path.join(folder1, filename)
+                src2 = os.path.join(folder2, filename)
+                final_output = os.path.join(output_folder, filename)
+                
+                src_mkv1 = MKVFile(src1)
+                src_mkv2 = MKVFile(src2)
+                new_mkv = MKVFile()
+                new_mkv.title = title
+                
+                for selection in ts_snapshot_1:
+                    if selection["include"]:
+                        mt = next((t for t in src_mkv1.tracks if t.track_id == selection["track_obj"].track_id), None)
+                        if mt:
+                            mt.language = selection["language"]
+                            mt.track_name = selection["name"]
+                            mt.default_track = selection["default"]
+                            mt.forced_track = selection["forced"]
+                            new_mkv.add_track(mt)
+
+                for selection in ts_snapshot_2:
+                    if selection["include"]:
+                        mt = next((t for t in src_mkv2.tracks if t.track_id == selection["track_obj"].track_id), None)
+                        if mt:
+                            mt.language = selection["language"]
+                            mt.track_name = selection["name"]
+                            mt.default_track = selection["default"]
+                            mt.forced_track = selection["forced"]
+                            new_mkv.add_track(mt)
+
+                if not inc_chap_1:
+                    try: src_mkv1.no_chapters()
+                    except AttributeError: pass
+                if not inc_chap_2:
+                    try: src_mkv2.no_chapters()
+                    except AttributeError: pass
+                if not inc_tags_1:
+                    try: src_mkv1.no_global_tags()
+                    except AttributeError: pass
+                if not inc_tags_2:
+                    try: src_mkv2.no_global_tags()
+                    except AttributeError: pass
+                if not inc_att_1:
+                    try: src_mkv1.no_attachments()
+                    except AttributeError: pass
+                if not inc_att_2:
+                    try: src_mkv2.no_attachments()
+                    except AttributeError: pass
+
+                cmd_res = new_mkv.command(final_output)
+                
+                cmd_list = []
+                if isinstance(cmd_res, str):
+                    import shlex
+                    for arg in shlex.split(cmd_res, posix=False):
+                        if (arg.startswith('"') and arg.endswith('"')) or (arg.startswith("'") and arg.endswith("'")):
+                            arg = arg.strip('\'"')
+                        cmd_list.append(arg)
+                else:
+                    cmd_list = list(cmd_res)
+                
+                import shlex
+                continuation = " ^\n  " if is_bat else " \\\n  "
+                formatted_args = []
+                for arg in cmd_list:
+                    arg_str = str(arg)
+                    if is_bat:
+                        quoted = f'"{arg_str}"' if " " in arg_str or not arg_str else arg_str
+                    else:
+                        quoted = shlex.quote(arg_str)
+                    formatted_args.append(quoted)
+                    
+                readable_cmd = ""
+                if formatted_args:
+                    readable_cmd = str(formatted_args[0])
+                    for idx in range(1, len(formatted_args)):
+                        arg = str(formatted_args[idx])
+                        if arg.startswith('"-') or arg.startswith("'-") or arg.startswith('-') or arg in ('"("', "'('", "("):
+                            readable_cmd = str(readable_cmd) + str(continuation) + str(arg)
+                        else:
+                            readable_cmd = str(readable_cmd) + " " + str(arg)
+                        
+                if is_bat:
+                    commands.append(f":: Merging {filename}")
+                else:
+                    commands.append(f"# Merging {filename}")
+                commands.append(readable_cmd)
+                commands.append("")
+            except Exception as e:
+                print(f"[ERROR] Could not generate command for {filename}: {e}")
+
+        try:
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(commands))
+                
+            if not is_bat:
+                import stat
+                st = os.stat(script_path)
+                os.chmod(script_path, st.st_mode | stat.S_IEXEC)
+                
+            self.root.after(0, lambda: self.finish_progress_window(f"Script saved to {os.path.basename(script_path)}", success=True))
+        except Exception as e:
+            self.root.after(0, lambda e_t=e: self.finish_progress_window(f"Error saving script: {e_t}", success=False))
 
     def save_preset(self):
         preset_data = {
