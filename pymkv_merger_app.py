@@ -9,7 +9,119 @@ from pymkv import MKVFile
 import threading
 import concurrent.futures
 
+
+class ScrollableFrame(ttk.Frame):
+    """Reusable scrollable container: Canvas + inner frame + vertical/horizontal scrollbars.
+
+    - The scrollregion follows the inner frame via its <Configure> event.
+    - The inner frame width is tracked to the canvas width (so content stretches
+      horizontally), but never below the inner frame's requested width, which is
+      what enables the horizontal scrollbar when the window is squeezed.
+    - Mousewheel scrolling is bound app-wide (bind_all) but guarded with
+      'winfo containing', so only the frame under the pointer scrolls and it
+      also works while hovering child widgets. Handles Windows/macOS
+      <MouseWheel> (delta multiples of 120 and small deltas) and Linux
+      <Button-4>/<Button-5>. Handlers left over from destroyed windows become
+      cheap no-ops because they check canvas existence first.
+    """
+
+    WHEEL_NOTCH_UNITS = 3  # scroll steps per wheel notch (see yscrollincrement)
+
+    def __init__(self, parent, scroll_step_pixels=30, **kwargs):
+        super().__init__(parent, **kwargs)
+
+        self._canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0,
+                                 yscrollincrement=scroll_step_pixels)
+        self._vbar = ttk.Scrollbar(self, orient="vertical", command=self._canvas.yview)
+        self._hbar = ttk.Scrollbar(self, orient="horizontal", command=self._canvas.xview)
+
+        self._inner = ttk.Frame(self._canvas)
+        self._inner_window = self._canvas.create_window((0, 0), window=self._inner, anchor="nw")
+        self._canvas.configure(yscrollcommand=self._vbar.set, xscrollcommand=self._hbar.set)
+
+        self._canvas.grid(row=0, column=0, sticky="nsew")
+        self._vbar.grid(row=0, column=1, sticky="ns")
+        self._hbar.grid(row=1, column=0, sticky="ew")
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+
+        self._inner.bind("<Configure>", self._on_inner_configure)
+        self._canvas.bind("<Configure>", self._on_canvas_configure)
+
+        self._canvas.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
+        self._canvas.bind_all("<Button-4>", self._on_mousewheel, add="+")
+        self._canvas.bind_all("<Button-5>", self._on_mousewheel, add="+")
+
+    @property
+    def inner(self):
+        """Frame to parent all scrollable content into."""
+        return self._inner
+
+    @property
+    def canvas(self):
+        return self._canvas
+
+    def _on_inner_configure(self, event):
+        bbox = self._canvas.bbox("all")
+        if bbox:
+            self._canvas.configure(scrollregion=bbox)
+        self._sync_inner_width()
+
+    def _on_canvas_configure(self, event):
+        self._sync_inner_width()
+
+    def _sync_inner_width(self):
+        # Track the canvas width so content fills the viewport, but keep at
+        # least the inner frame's requested width so horizontal scrolling
+        # still works when the window is narrower than the content.
+        self._canvas.itemconfigure(
+            self._inner_window,
+            width=max(self._canvas.winfo_width(), self._inner.winfo_reqwidth()))
+
+    def _on_mousewheel(self, event):
+        try:
+            if not self._canvas.winfo_exists():
+                return
+            # Only scroll when the pointer is over this frame or one of its
+            # descendants; bind_all fires for every widget in the app.
+            # 'winfo containing' is global (root coords -> widget path or "").
+            inside = self.tk.call("winfo", "containing", event.x_root, event.y_root)
+            if not inside:
+                return
+            base = self._w
+            if inside != base and not inside.startswith(base + "."):
+                return
+            first, last = self._canvas.yview()
+            if last - first >= 1.0:
+                return  # all content already visible
+            direction = self._wheel_direction(event)
+            if direction:
+                self._canvas.yview_scroll(direction * self.WHEEL_NOTCH_UNITS, "units")
+        except tk.TclError:
+            return
+
+    @staticmethod
+    def _wheel_direction(event):
+        # Returns +1 to scroll down, -1 to scroll up, 0 for no action.
+        num = getattr(event, "num", None)
+        if num == 4:  # Linux X11: button 4 = wheel up
+            return -1
+        if num == 5:  # Linux X11: button 5 = wheel down
+            return 1
+        delta = getattr(event, "delta", 0)  # Windows/macOS: +120/-120 or small deltas
+        if not delta:
+            return 0
+        return -1 if delta > 0 else 1
+
+
 class Pymkv2MergerApp:
+    # Shared column layout for the track tabs: the sticky header frame and the
+    # scrollable rows container get the same grid-column minsize values (px) so
+    # the columns line up.
+    TRACK_HEADERS = ("Include", "ID", "Type", "Codec", "Language", "Name", "Default", "Forced")
+    TRACK_COLUMN_WIDTHS = (56, 48, 76, 200, 84, 280, 76, 64)
+    TRACK_FILTER_VALUES = ("All", "Video", "Audio", "Subtitles", "Other")
+
     def __init__(self, root):
         self.root = root
         self.root.title("Batch MKV Merger - J0nan")
@@ -43,6 +155,11 @@ class Pymkv2MergerApp:
         self.file_jsons = {1: None, 2: None}
         self.sample_paths = {1: None, 2: None}
 
+        # Per-file state for the track tabs (rebuilt every time the track window opens).
+        self._track_row_widgets = {}    # file_index -> [{"row", "track_type", "widgets"}, ...]
+        self._track_filter_vars = {}     # file_index -> StringVar (combobox value)
+        self._track_counter_labels = {}  # file_index -> ttk.Label ("N of M selected")
+
         main_frame = ttk.Frame(root, padding="10")
         main_frame.pack(fill="both", expand=True)
 
@@ -56,6 +173,8 @@ class Pymkv2MergerApp:
 
         self.start_merge_button = None
         self.export_script_button = None
+        self.track_window = None
+        self.track_notebook = None
         self.merge_thread = None
         self.check_thread = None
         self.export_thread = None
@@ -350,21 +469,32 @@ class Pymkv2MergerApp:
         has_attachments1 = bool(self.file_jsons[1] and self.file_jsons[1].get("attachments"))
         has_attachments2 = bool(self.file_jsons[2] and self.file_jsons[2].get("attachments"))
 
+        self._build_track_selection_window(mkv1, mkv2, sample_filename,
+                                           has_chapters1=has_chapters1, has_chapters2=has_chapters2,
+                                           has_tags1=has_tags1, has_tags2=has_tags2,
+                                           has_attachments1=has_attachments1, has_attachments2=has_attachments2)
+
+    def _build_track_selection_window(self, mkv1, mkv2, sample_filename,
+                                      has_chapters1=False, has_chapters2=False,
+                                      has_tags1=False, has_tags2=False,
+                                      has_attachments1=False, has_attachments2=False):
+        """Build the Track Selection window: fixed bottom action bar + Notebook body.
+
+        Split out from _continue_setup_track_selection so the window can be built
+        with injected track objects (used by the GUI smoke test).
+        """
         self.track_window = tk.Toplevel(self.root)
         self.track_window.title("Track Selection and Customization")
+        self.track_window.geometry("1100x720")
+        self.track_window.minsize(900, 560)
 
         folder1_name = os.path.basename(os.path.normpath(self.folder1_path.get()))
         folder2_name = os.path.basename(os.path.normpath(self.folder2_path.get()))
-        self.create_track_widgets(self.track_window, f"File 1: {sample_filename} (from '{folder1_name}')", mkv1, 1)
-        self.create_track_widgets(self.track_window, f"File 2: {sample_filename} (from '{folder2_name}')", mkv2, 2)
 
-        self.create_global_properties_widgets(self.track_window, mkv1, sample_filename,
-                                             has_chapters1=has_chapters1, has_chapters2=has_chapters2,
-                                             has_tags1=has_tags1, has_tags2=has_tags2,
-                                             has_attachments1=has_attachments1, has_attachments2=has_attachments2)
-
-        button_frame = ttk.Frame(self.track_window)
-        button_frame.pack(pady=10, fill="x")
+        # Action bar is packed with side="bottom" BEFORE the body so the buttons
+        # stay visible no matter how many tracks the body contains.
+        button_frame = ttk.Frame(self.track_window, padding=(10, 8))
+        button_frame.pack(side="bottom", fill="x")
         ttk.Button(button_frame, text="Save Preset", command=self.save_preset).pack(side="left", padx=10)
         ttk.Button(button_frame, text="Load Preset", command=self.load_preset).pack(side="left", padx=5)
 
@@ -373,6 +503,27 @@ class Pymkv2MergerApp:
 
         self.export_script_button = ttk.Button(button_frame, text="Export Batch Script", command=self.export_batch_script)
         self.export_script_button.pack(side="right", padx=5)
+
+        notebook = ttk.Notebook(self.track_window)
+        notebook.pack(fill="both", expand=True, padx=10, pady=(10, 0))
+        self.track_notebook = notebook
+
+        file1_tab = ttk.Frame(notebook, padding=6)
+        file2_tab = ttk.Frame(notebook, padding=6)
+        output_tab = ttk.Frame(notebook, padding=6)
+        notebook.add(file1_tab, text="File 1")
+        notebook.add(file2_tab, text="File 2")
+        notebook.add(output_tab, text="Output Options")
+
+        self.create_track_widgets(file1_tab, f"File 1: {sample_filename} (from '{folder1_name}')", mkv1, 1)
+        self.create_track_widgets(file2_tab, f"File 2: {sample_filename} (from '{folder2_name}')", mkv2, 2)
+
+        output_scroll = ScrollableFrame(output_tab)
+        output_scroll.pack(fill="both", expand=True)
+        self.create_global_properties_widgets(output_scroll.inner, mkv1, sample_filename,
+                                             has_chapters1=has_chapters1, has_chapters2=has_chapters2,
+                                             has_tags1=has_tags1, has_tags2=has_tags2,
+                                             has_attachments1=has_attachments1, has_attachments2=has_attachments2)
 
     def create_global_properties_widgets(self, parent, mkv1, filename,
                                          has_chapters1=False, has_chapters2=False,
@@ -577,16 +728,89 @@ class Pymkv2MergerApp:
         vscroll.pack(side="right", fill="y")
         hscroll.pack(side="bottom", fill="x")
 
+    def _configure_track_columns(self, container):
+        # Apply the same column configuration to the sticky header frame and to
+        # the scrollable rows container so header/row alignment stays close.
+        for col, width in enumerate(self.TRACK_COLUMN_WIDTHS):
+            container.grid_columnconfigure(col, minsize=width)
+
+    def _update_track_count(self, file_index):
+        label = self._track_counter_labels.get(file_index)
+        if label is None:
+            return
+        try:
+            if not label.winfo_exists():
+                return
+            selections = self.track_selections.get(file_index, [])
+            selected = sum(1 for s in selections if s["include"].get())
+            label.config(text=f"{selected} of {len(selections)} selected")
+        except tk.TclError:
+            pass
+
+    def _set_all_tracks_include(self, file_index, value):
+        for selection in self.track_selections.get(file_index, []):
+            selection["include"].set(value)
+
+    def _apply_track_filter(self, file_index):
+        filter_var = self._track_filter_vars.get(file_index)
+        if filter_var is None:
+            return
+        filter_value = filter_var.get()
+        for row_meta in self._track_row_widgets.get(file_index, []):
+            track_type = row_meta["track_type"]
+            if filter_value == "All":
+                matches = True
+            elif filter_value == "Other":
+                matches = track_type not in ("video", "audio", "subtitles")
+            else:
+                matches = track_type == filter_value.lower()
+            # grid_remove hides the row but keeps its grid config and the row's
+            # Tk variables intact; grid() brings it back exactly as it was.
+            for widget in row_meta["widgets"]:
+                if matches:
+                    widget.grid()
+                else:
+                    widget.grid_remove()
+
     def create_track_widgets(self, parent, title, mkv_file, file_index):
-        frame = ttk.LabelFrame(parent, text=title)
-        frame.pack(padx=10, pady=10, fill="x", expand=True)
+        # parent is the Notebook tab frame for this file: toolbar row, then a
+        # sticky header (outside the canvas, so it never scrolls away), then a
+        # scrollable region containing one grid row per track.
         self.track_selections[file_index] = []
+        self._track_row_widgets[file_index] = []
+        self._track_filter_vars[file_index] = tk.StringVar(value="All")
 
-        headers = ["Include", "ID", "Type", "Codec", "Language", "Name", "Default", "Forced"]
-        for i, header in enumerate(headers):
-            ttk.Label(frame, text=header, font=("TkDefaultFont", 9, "bold")).grid(row=0, column=i, padx=5, sticky="w")
+        ttk.Label(parent, text=title, font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(0, 4))
 
-        for i, track in enumerate(mkv_file.tracks):
+        toolbar = ttk.Frame(parent)
+        toolbar.pack(fill="x", pady=(0, 4))
+        ttk.Button(toolbar, text="Include all",
+                   command=lambda fi=file_index: self._set_all_tracks_include(fi, True)).pack(side="left", padx=(0, 4))
+        ttk.Button(toolbar, text="Exclude all",
+                   command=lambda fi=file_index: self._set_all_tracks_include(fi, False)).pack(side="left")
+        ttk.Label(toolbar, text="Filter:").pack(side="left", padx=(12, 2))
+        filter_combo = ttk.Combobox(toolbar, textvariable=self._track_filter_vars[file_index],
+                                    values=list(self.TRACK_FILTER_VALUES), state="readonly", width=12)
+        filter_combo.pack(side="left")
+        filter_combo.bind("<<ComboboxSelected>>", lambda event, fi=file_index: self._apply_track_filter(fi))
+        counter_label = ttk.Label(toolbar, text="0 of 0 selected")
+        counter_label.pack(side="right")
+        self._track_counter_labels[file_index] = counter_label
+
+        header_frame = ttk.Frame(parent)
+        header_frame.pack(fill="x")
+        self._configure_track_columns(header_frame)
+        for col, header_text in enumerate(self.TRACK_HEADERS):
+            ttk.Label(header_frame, text=header_text, font=("TkDefaultFont", 9, "bold")).grid(
+                row=0, column=col, padx=4, sticky="w")
+
+        scroll = ScrollableFrame(parent)
+        scroll.pack(fill="both", expand=True)
+        rows_container = scroll.inner
+        self._configure_track_columns(rows_container)
+
+        tracks = list(getattr(mkv_file, "tracks", None) or [])
+        for i, track in enumerate(tracks):
             include_var = tk.BooleanVar(value=True)
             lang_var = tk.StringVar(value=track.language or "und")
             name_var = tk.StringVar(value=track.track_name or "")
@@ -596,16 +820,29 @@ class Pymkv2MergerApp:
                 "track_obj": track, "include": include_var, "language": lang_var,
                 "name": name_var, "default": default_var, "forced": forced_var
             })
+            include_var.trace_add("write", lambda *args, fi=file_index: self._update_track_count(fi))
+
             row = i + 1
-            ttk.Checkbutton(frame, variable=include_var).grid(row=row, column=0)
-            ttk.Label(frame, text=str(track.track_id)).grid(row=row, column=1, sticky="w")
-            ttk.Label(frame, text=track.track_type.capitalize()).grid(row=row, column=2, sticky="w")
-            codec_str = getattr(track, 'track_codec', 'N/A')
-            ttk.Label(frame, text=codec_str).grid(row=row, column=3, sticky="w")
-            ttk.Entry(frame, textvariable=lang_var, width=6).grid(row=row, column=4, sticky="w")
-            ttk.Entry(frame, textvariable=name_var, width=28).grid(row=row, column=5, sticky="w")
-            ttk.Checkbutton(frame, variable=default_var).grid(row=row, column=6)
-            ttk.Checkbutton(frame, variable=forced_var).grid(row=row, column=7)
+            widgets = [
+                ttk.Checkbutton(rows_container, variable=include_var),
+                ttk.Label(rows_container, text=str(track.track_id)),
+                ttk.Label(rows_container, text=str(track.track_type).capitalize()),
+                ttk.Label(rows_container, text=getattr(track, "track_codec", "N/A")),
+                ttk.Entry(rows_container, textvariable=lang_var, width=6),
+                ttk.Entry(rows_container, textvariable=name_var, width=28),
+                ttk.Checkbutton(rows_container, variable=default_var),
+                ttk.Checkbutton(rows_container, variable=forced_var),
+            ]
+            for col, widget in enumerate(widgets):
+                widget.grid(row=row, column=col, padx=4, pady=1, sticky="w")
+
+            self._track_row_widgets[file_index].append({
+                "row": row,
+                "track_type": str(track.track_type or "").lower(),
+                "widgets": widgets,
+            })
+
+        self._update_track_count(file_index)
 
     def show_progress_window(self, maximum):
         if self.progress_window and tk.Toplevel.winfo_exists(self.progress_window):
